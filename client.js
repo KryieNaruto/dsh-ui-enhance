@@ -2353,10 +2353,9 @@ function usePaneFocus(enabled) {
         'outline:0' +
       '}',
 
-      /* --- global silk: motion everywhere, without re-laying anything out --- */
-      'html.' + WINDOW_CLASS + ' .ue-col *{' +
-        'scroll-behavior:smooth' +
-      '}',
+      /* 不再在全局面板里强制 `scroll-behavior:smooth`：它把每一次程序化
+       * `scrollTop` 赋值都变成动画，于是切换会话时会从头滚到底，长列表里
+       * 每帧的滚动同步也变成动画，读数与手感都明显变卡。 */
       /* Entrances only: a card fades and lifts into place once, driven by CSS.
        * Nothing here is re-triggered by a re-render, because the animation is bound
        * to the element's first paint rather than to a state change. */

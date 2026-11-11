@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="UI 增强">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3b8fd4"/>
+      <stop offset="1" stop-color="#1d5f9e"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="14" fill="url(#bg)"/>
+  <path d="M32 15l3.2 8.8L44 27l-8.8 3.2L32 39l-3.2-8.8L20 27l8.8-3.2z" fill="#ffffff"/>
+  <circle cx="45" cy="19" r="2.4" fill="#cfe6fb"/>
+  <rect x="18" y="44" width="28" height="3.4" rx="1.7" fill="#ffffff" opacity="0.9"/>
+  <rect x="18" y="50" width="16" height="3.4" rx="1.7" fill="#ffffff" opacity="0.55"/>
+</svg>

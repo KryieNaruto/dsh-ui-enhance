@@ -1,0 +1,34 @@
+{
+  "name": "@local/ui-enhance",
+  "version": "0.9.35",
+  "private": true,
+  "type": "module",
+  "description": "UI 增强：按会话独立的上下文预算与占用环、手动压缩、会话侧栏上下文圆点、模型/强度标识、额度剩余与本地时间、磨砂玻璃面板与 ShaderToy 背景（在线拉取与本地代码编辑合一）。",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "shadertoy.mjs",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  }
+}

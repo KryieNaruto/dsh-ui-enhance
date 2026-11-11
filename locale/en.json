@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "UI Enhance",
+    "description": "Floats a small panel just left of the composer card with this Turn's and this Session's token consumption and estimated cost, the relay's remaining quota and the local time, context-window tiers (200K/400K/800K/1M) and manual compaction; the sidebar also marks each session with a bar that grows with context usage."
+  }
+}

@@ -1120,9 +1120,19 @@ export function apply(ctx, config = {}) {
                   ? presets.serviceFor(agent, 'compaction')
                   : undefined
               if (meter && compaction && typeof compaction.compactIfNeeded === 'function') {
-                const measurement = meter.measure(agent.session)
+                // Measure what the page shows, not a separate estimate: `meter.measure()`
+                // replays the whole surface with heuristics and routinely reads far above
+                // the provider's own prompt size (which is why a 18% context looked like
+                // 90% and compacted). `contextPressure` is the same projection the composer
+                // ring renders, and `pressureTokens` is the measured prompt itself.
+                const pressure =
+                  typeof meter.contextPressure === 'function' ? meter.contextPressure(agent.session) : undefined
                 const used =
-                  measurement && typeof measurement.totalTokens === 'number' ? measurement.totalTokens : undefined
+                  pressure && typeof pressure.pressureTokens === 'number'
+                    ? pressure.pressureTokens
+                    : pressure && typeof pressure.projectedTokens === 'number'
+                      ? pressure.projectedTokens
+                      : undefined
                 if (used !== undefined && !reportedUsage.has(sessionId)) {
                   reportedUsage.add(sessionId)
                   probe('budget-check', {

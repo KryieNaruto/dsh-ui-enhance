@@ -871,8 +871,12 @@ window.__ModuleLoader__.load({
     function useSessionWindow(sessionId) {
       const [, force] = React.useReducer((value) => value + 1, 0);
       React.useEffect(() => windowStore.subscribe(force), []);
-      /* New sessions default to a 200K window; only an explicit per-session choice overrides it. */
-      return windowStore.get(sessionId) ?? 200000;
+      /* Undefined means "auto": the harness's own context window is the denominator.
+       * A hard 200K default pinned every session to a fifth of a 1M window, so the
+       * ring read 90% at 180K, auto-compaction armed in sessions the user never gave
+       * a budget, and the sidebar bars (which already fall back to the live
+       * contextWindow) disagreed with the HUD. */
+      return windowStore.get(sessionId);
     }
 
     /**
@@ -2295,6 +2299,16 @@ function usePaneFocus(enabled) {
         'animation:ue-win-in .42s cubic-bezier(.32,.72,0,1) both' +
       '}',
       '@keyframes ue-win-in{from{opacity:0;transform:translateY(8px) scale(.995)}to{opacity:1;transform:none}}',
+      /* `backdrop-filter` (and the entrance `transform`) give a column its own
+       * stacking context, and that also makes it the containing block for the
+       * shipped Windows titlebar toggle -- a `position:fixed; z-index:30` button.
+       * Collapsed, the sidebar column is 1px wide with `overflow:hidden` for its
+       * rounded corners, so the expand button is clipped and then painted *under*
+       * the centre column: "点收起后展开按钮不见了". A collapsed rail has nothing
+       * else to clip, so lift that one column and let it paint outside. */
+      'html.' + WINDOW_CLASS + ' [class*="sidebarCol"]:has([class*="wtg9ga_collapsed"]){' +
+        'position:relative!important;z-index:5!important;overflow:visible!important' +
+      '}',
       '@media (prefers-reduced-motion:reduce){' +
         'html.' + WINDOW_CLASS + ' .ue-col{animation:none}' +
         'html.' + WINDOW_CLASS + ' .ue-session-row,html.' + WINDOW_CLASS + ' .ue-hover-slider{transition:none}' +

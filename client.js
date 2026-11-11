@@ -1177,6 +1177,8 @@ function usePaneFocus(enabled) {
 
     let frame = 0;
     let disposed = false;
+    let paneRects = [];
+    let paneObserver = null;
 
     const panesOf = () => {
       const found = [];
@@ -1185,16 +1187,21 @@ function usePaneFocus(enabled) {
           if (node instanceof HTMLElement && !found.includes(node)) found.push(node);
         }
       }
-      for (const node of found) node.setAttribute('data-ui-enhance-pane', '');
+      for (const node of found) {
+        if (node.getAttribute('data-ui-enhance-pane') !== '') node.setAttribute('data-ui-enhance-pane', '');
+      }
       return found;
     };
 
     // The deepest pane containing the point wins (centerCol may nest other panels).
+    // Boxes are cached so the per-frame pointer path never forces layout.
     const paneAt = (x, y) => {
       let lit = null;
-      for (const node of panes) {
-        const box = node.getBoundingClientRect();
+      for (let i = 0; i < panes.length; i += 1) {
+        const box = paneRects[i];
+        if (!box) continue;
         if (x < box.left || x > box.right || y < box.top || y > box.bottom) continue;
+        const node = panes[i];
         if (lit === null || node.contains(lit)) lit = node;
       }
       return lit;
@@ -1202,12 +1209,34 @@ function usePaneFocus(enabled) {
 
     const paint = (lit) => {
       for (const node of panes) {
-        node.setAttribute('data-ui-enhance-pane-lit', node === lit ? 'true' : 'false');
-        node.setAttribute('data-ui-enhance-pane-dim', lit !== null && node !== lit ? 'true' : 'false');
+        const nextLit = node === lit ? 'true' : 'false';
+        const nextDim = lit !== null && node !== lit ? 'true' : 'false';
+        if (node.getAttribute('data-ui-enhance-pane-lit') !== nextLit) {
+          node.setAttribute('data-ui-enhance-pane-lit', nextLit);
+        }
+        if (node.getAttribute('data-ui-enhance-pane-dim') !== nextDim) {
+          node.setAttribute('data-ui-enhance-pane-dim', nextDim);
+        }
       }
     };
 
-    let panes = panesOf();
+    // Measuring is only done when layout may have changed, not on every frame.
+    const measure = () => {
+      paneRects = panes.map((node) => node.getBoundingClientRect());
+    };
+    const watch = (nodes) => {
+      if (typeof ResizeObserver === 'undefined') return;
+      if (paneObserver === null) paneObserver = new ResizeObserver(() => measure());
+      paneObserver.disconnect();
+      for (const node of nodes) paneObserver.observe(node);
+    };
+    const refreshPanes = () => {
+      panes = panesOf();
+      measure();
+      watch(panes);
+    };
+    let panes = [];
+    refreshPanes();
 
     const onMove = (event) => {
       if (disposed || frame !== 0) return;
@@ -1216,7 +1245,7 @@ function usePaneFocus(enabled) {
       frame = window.requestAnimationFrame(() => {
         frame = 0;
         if (disposed) return;
-        if (panes.length === 0) panes = panesOf();
+        if (panes.length === 0) refreshPanes();
         paint(paneAt(x, y));
       });
     };
@@ -1226,6 +1255,7 @@ function usePaneFocus(enabled) {
     };
 
     window.addEventListener('pointermove', onMove, { passive: true });
+    window.addEventListener('resize', measure);
     document.addEventListener('pointerleave', clear, true);
     window.addEventListener('blur', clear);
 
@@ -1233,8 +1263,14 @@ function usePaneFocus(enabled) {
       disposed = true;
       if (frame !== 0) window.cancelAnimationFrame(frame);
       window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('resize', measure);
       document.removeEventListener('pointerleave', clear, true);
       window.removeEventListener('blur', clear);
+      if (paneObserver !== null) {
+        paneObserver.disconnect();
+        paneObserver = null;
+      }
+      paneRects = [];
       root.removeAttribute('data-ui-enhance-focus');
       for (const node of panes) {
         node.removeAttribute('data-ui-enhance-pane');
@@ -1953,8 +1989,9 @@ function usePaneFocus(enabled) {
          * blurred picture: saturation pulls the colour BACK through the tint (a tinted
          * pane otherwise greys out), and the slight brightness lift is the pane being
          * lit from outside. */
-        'backdrop-filter:blur(var(--ue-win-blur,18px)) saturate(215%) brightness(1.10)!important;' +
-        '-webkit-backdrop-filter:blur(var(--ue-win-blur,18px)) saturate(215%) brightness(1.10)!important;' +
+        'backdrop-filter:none!important;' +
+        '-webkit-backdrop-filter:none!important;' +
+        'isolation:isolate!important;' +
         /* The 1px rim must be part of the column's width. With the default
          * `content-box` a bordered grid column measures `track + 2px`, so three panes
          * pushed 6px past the frame and scrolled the whole window sideways. */
@@ -1984,6 +2021,16 @@ function usePaneFocus(enabled) {
           'width var(--ds-transition-duration-slow,.32s) var(--ds-ease-in-out,ease),' +
           'flex-basis var(--ds-transition-duration-slow,.32s) var(--ds-ease-in-out,ease)' +
       '}',
+      /* One blur for the whole window. The three panes used to each run their own
+       * backdrop-filter, which re-samples the backdrop per pane per frame; this
+       * full-window layer blurs once and the panes just sit on top of it. It is
+       * appended after the background canvas (which is `z-index:-1`), so it needs no
+       * z-index of its own. */
+      'html.' + WINDOW_CLASS + ' #' + BEAUTIFY_BG_ID + ' [data-ue-glass-layer]{' +
+        'position:fixed;inset:0;pointer-events:none;' +
+        'backdrop-filter:blur(var(--ue-win-blur,18px)) saturate(215%) brightness(1.10)!important;' +
+        '-webkit-backdrop-filter:blur(var(--ue-win-blur,18px)) saturate(215%) brightness(1.10)!important' +
+      '}',
       /* The right sidebar is NOT one of the three grid tracks the rule above rounds.
        * dsh-client-ui-layout mounts a zero-width track there and the occupant draws
        * the real panel itself, absolutely positioned against the frame right edge
@@ -1999,8 +2046,8 @@ function usePaneFocus(enabled) {
         'border-radius:var(--ue-win-radius,16px)!important;' +
         'overflow:hidden!important;' +
         'background-color:color-mix(in srgb,var(--dsw-alias-bg-base) var(--ue-win-alpha,32%),transparent)!important;' +
-        'backdrop-filter:blur(var(--ue-win-blur,18px)) saturate(185%) brightness(1.06)!important;' +
-        '-webkit-backdrop-filter:blur(var(--ue-win-blur,18px)) saturate(185%) brightness(1.06)!important;' +
+        'backdrop-filter:none!important;' +
+        '-webkit-backdrop-filter:none!important;' +
         'border:1px solid rgba(255,255,255,calc(.10 + var(--ue-win-border,.14) * .55))!important;' +
         'box-sizing:border-box!important' +
       '}',
@@ -2543,8 +2590,24 @@ function usePaneFocus(enabled) {
         /** Cached pass key -> entry lookup, rebuilt only when the pass list changes. */
         byKey: null,
         byKeySize: -1,
+        /** Canvas box, written by the ResizeObserver; 0 until layout has run. */
+        boxW: 0,
+        boxH: 0,
+        boxDirty: false,
       };
       const mouse = { x: 0, y: 0, clickX: 0, clickY: 0, down: 0 };
+      /* The canvas box is measured off the rAF path: reading it every frame forced
+       * layout on the same thread that scrolls the heavy views behind the backdrop. */
+      const boxObserver =
+        typeof ResizeObserver === 'undefined'
+          ? null
+          : new ResizeObserver((entries) => {
+              const box = entries[entries.length - 1].contentRect;
+              state.boxW = box.width;
+              state.boxH = box.height;
+              state.boxDirty = true;
+            });
+      if (boxObserver !== null) boxObserver.observe(canvas);
 
       const compile = (type, source) => {
         const shader = gl.createShader(type);
@@ -2744,10 +2807,10 @@ function usePaneFocus(enabled) {
          * A 0x0 box means layout has not run yet. Storing it here would leave `viewW`
          * permanently at 0 and force a realloc every single frame, which reads as the
          * backdrop flickering black. Skip until the box is real. */
-        const box = canvas.getBoundingClientRect();
-        if (box.width > 0 && box.height > 0 && (box.width !== state.viewW || box.height !== state.viewH)) {
-          state.viewW = box.width;
-          state.viewH = box.height;
+        if (state.boxW > 0 && state.boxH > 0 && (state.boxW !== state.viewW || state.boxH !== state.viewH || state.boxDirty)) {
+          state.viewW = state.boxW;
+          state.viewH = state.boxH;
+          state.boxDirty = false;
           resize();
         }
         if (state.passes.length === 0) return;
@@ -2795,11 +2858,12 @@ function usePaneFocus(enabled) {
       };
 
       const onMove = (event) => {
-        const rect = canvas.getBoundingClientRect();
-        const scaleX = canvas.width / Math.max(1, rect.width);
-        const scaleY = canvas.height / Math.max(1, rect.height);
-        mouse.x = (event.clientX - rect.left) * scaleX;
-        mouse.y = (rect.height - (event.clientY - rect.top)) * scaleY;
+        const width = state.viewW || 1;
+        const height = state.viewH || 1;
+        const scaleX = canvas.width / Math.max(1, width);
+        const scaleY = canvas.height / Math.max(1, height);
+        mouse.x = event.clientX * scaleX;
+        mouse.y = (height - event.clientY) * scaleY;
       };
       const onDown = (event) => {
         onMove(event);
@@ -2961,6 +3025,7 @@ function usePaneFocus(enabled) {
         state.disposed = true;
         if (state.raf) window.cancelAnimationFrame(state.raf);
         state.raf = 0;
+        if (boxObserver !== null) boxObserver.disconnect();
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerdown', onDown);
         window.removeEventListener('pointerup', onUp);
@@ -3090,6 +3155,14 @@ function usePaneFocus(enabled) {
        * the app and the glass would blur its own backdrop. Keep it first. */
       if (document.body.firstElementChild !== node) {
         document.body.insertBefore(node, document.body.firstElementChild || null);
+      }
+      /* The single blur for the whole window lives here. Appended last, it sits above
+       * the background canvas (which is `z-index:-1`) and below the app. */
+      if (node.querySelector('[data-ue-glass-layer]') === null) {
+        const glass = document.createElement('div');
+        glass.setAttribute('data-ue-glass-layer', '');
+        glass.setAttribute('aria-hidden', 'true');
+        node.appendChild(glass);
       }
       return node;
     }
@@ -7124,6 +7197,11 @@ function usePaneFocus(enabled) {
             const observer = new MutationObserver((records) => {
               for (const record of records) {
                 if (record.type === 'attributes') {
+                  const t = record.target;
+                  if (t instanceof Element &&
+                      (t.hasAttribute('data-ui-enhance-pane') || t.hasAttribute('data-ui-enhance-ctx-bar'))) {
+                    continue;
+                  }
                   schedule();
                   return;
                 }

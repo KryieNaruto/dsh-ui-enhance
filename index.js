@@ -28,8 +28,14 @@ const PROBE_PATH = '/plugin/ui-enhance/probe'
 const PROBE_LIMIT = 300
 /** Browser-local per-Session budgets mirrored by the Client half. */
 const BUDGETS_PATH = '/plugin/ui-enhance/budgets'
+/** The model's real capacity lives in the profile patch; a tier change has to move it there. */
+const CONTEXT_WINDOW_PATH = '/plugin/ui-enhance/context-window'
+const CONTEXT_WINDOW_MIN = 8000
+const CONTEXT_WINDOW_MAX = 8000000
 /** Force-stop one Session's in-flight work (turn or compaction) on the Client's request. */
 const ABORT_PATH = '/plugin/ui-enhance/abort'
+/** Forced compaction on the Client's request; the shipped command refuses while busy. */
+const COMPACT_PATH = '/plugin/ui-enhance/compact'
 /** Open compaction markers per Session, so the Client can offer "stop compaction". */
 const COMPACTIONS_PATH = '/plugin/ui-enhance/compactions'
 /** Compile check of the Client bundles the next document boot would load. */
@@ -527,6 +533,133 @@ export function apply(ctx, config = {}) {
         },
       }),
     'ui-enhance: quota route',
+  )
+
+  /** The desktop host receives its profile directory as a bare argv entry. */
+  function resolveProfileDir() {
+    for (const arg of process.argv.slice(1)) {
+      if (typeof arg !== 'string' || arg.length === 0) continue
+      if (!/[\\/]profiles[\\/][^\\/]+$/.test(arg)) continue
+      if (existsSync(join(arg, 'cordis.patch.yml'))) return arg
+    }
+    return undefined
+  }
+
+  /**
+   * Point one model entry of the profile's patch layer at a new context window. dsh-hmr watches
+   * that file, so the next model request already carries the new capacity. Line-based on
+   * purpose: the file is the user's hand-written patch and must keep its comments and ordering.
+   */
+  async function writeContextWindow(dir, model, size) {
+    const file = join(dir, 'cordis.patch.yml')
+    const text = await fs.readFile(file, 'utf8')
+    const eol = text.includes('\r\n') ? '\r\n' : '\n'
+    const lines = text.split(/\r?\n/)
+    const ids = []
+    let modelsIndent = -1
+    let target = -1
+    let indent = -1
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index]
+      const header = /^(\s*)models:\s*$/.exec(line)
+      if (header !== null) {
+        modelsIndent = header[1].length
+        continue
+      }
+      if (modelsIndent < 0) continue
+      const entry = /^(\s*)-\s+id:\s*(\S+)\s*$/.exec(line)
+      if (entry === null) {
+        if (/^\s*\S/.test(line) && line.search(/\S/) <= modelsIndent) modelsIndent = -1
+        continue
+      }
+      if (entry[1].length <= modelsIndent) {
+        modelsIndent = -1
+        continue
+      }
+      ids.push(entry[2])
+      if (target < 0 && (model === undefined || entry[2] === model)) {
+        target = index
+        indent = entry[1].length
+      }
+    }
+    if (target < 0) throw new Error('model-not-found: ' + ids.join(','))
+    const wanted = ' '.repeat(indent + 2) + 'contextWindow: ' + size
+    let existing = -1
+    for (let index = target + 1; index < lines.length; index += 1) {
+      const line = lines[index]
+      if (line.trim().length === 0) continue
+      const own = line.search(/\S/)
+      if (own <= indent) break
+      if (own === indent + 2 && /^\s*contextWindow\s*:/.test(line)) {
+        existing = index
+        break
+      }
+    }
+    if (existing >= 0) lines[existing] = wanted
+    else lines.splice(target + 1, 0, wanted)
+    const backup = file + '.bak-ctxwin'
+    if (!existsSync(backup)) await fs.writeFile(backup, text, 'utf8')
+    const scratch = file + '.tmp-' + String(process.pid)
+    await fs.writeFile(scratch, lines.join(eol), 'utf8')
+    await fs.rename(scratch, file)
+    return { path: file, model: ids[Math.max(0, ids.indexOf(model))], contextWindow: size }
+  }
+
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: CONTEXT_WINDOW_PATH,
+        handler: async (req, res) => {
+          if (!isLoopback(req.socket.remoteAddress)) {
+            reply(res, 403, { ok: false, error: 'forbidden' })
+            return
+          }
+          if (req.method !== 'POST') {
+            reply(res, 405, { ok: false, error: 'method' })
+            return
+          }
+          let raw = ''
+          for await (const chunk of req) {
+            raw += chunk
+            if (raw.length > 4096) {
+              reply(res, 413, { ok: false, error: 'too-large' })
+              return
+            }
+          }
+          let payload
+          try {
+            payload = JSON.parse(raw)
+          } catch (error) {
+            reply(res, 400, { ok: false, error: 'bad-json' })
+            return
+          }
+          const size = payload && payload.contextWindow
+          if (
+            typeof size !== 'number' ||
+            !Number.isFinite(size) ||
+            size < CONTEXT_WINDOW_MIN ||
+            size > CONTEXT_WINDOW_MAX
+          ) {
+            reply(res, 400, { ok: false, error: 'bad-payload' })
+            return
+          }
+          const dir = resolveProfileDir()
+          if (dir === undefined) {
+            reply(res, 200, { ok: false, error: 'no-profile-dir' })
+            return
+          }
+          const model = payload && typeof payload.model === 'string' && payload.model.length > 0 ? payload.model : undefined
+          try {
+            const result = await writeContextWindow(dir, model, Math.round(size))
+            probe('context-window', result)
+            reply(res, 200, Object.assign({ ok: true }, result))
+          } catch (error) {
+            reply(res, 200, { ok: false, error: String(error && error.message ? error.message : error) })
+          }
+        },
+      }),
+    'ui-enhance: context window route',
   )
 
   /**
@@ -1180,6 +1313,102 @@ export function apply(ctx, config = {}) {
         return next()
       }),
     'ui-enhance: turn-time budget compaction',
+  )
+
+  /**
+   * Forced compaction on the Client's request. The shipped `/compact` command is refused
+   * while the agent is busy, which is exactly the state a sub-agent is in for its whole
+   * turn, so the manual button failed every time. This runs the same reduction the
+   * turn-time path uses, which does not care whether a turn is in flight.
+   */
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: COMPACT_PATH,
+        handler: async (req, res) => {
+          if (!isLoopback(req.socket.remoteAddress)) {
+            reply(res, 403, { ok: false, error: 'forbidden' })
+            return
+          }
+          if (req.method !== 'POST') {
+            reply(res, 405, { ok: false, error: 'method' })
+            return
+          }
+          let raw = ''
+          for await (const chunk of req) {
+            raw += chunk
+            if (raw.length > 8192) {
+              reply(res, 413, { ok: false, error: 'too-large' })
+              return
+            }
+          }
+          let sessionId
+          try {
+            const payload = JSON.parse(raw || '{}')
+            sessionId = payload && payload.sessionId
+          } catch (error) {
+            reply(res, 400, { ok: false, error: 'bad-json' })
+            return
+          }
+          if (typeof sessionId !== 'string' || sessionId.length === 0 || sessionId.length > 128) {
+            reply(res, 400, { ok: false, error: 'bad-payload' })
+            return
+          }
+          const agents = ctx.get('agents')
+          let agent
+          if (agents && typeof agents.get === 'function') {
+            for (const candidate of sessionCandidates(sessionId)) {
+              try {
+                agent = agents.get(candidate)
+              } catch (error) {
+                agent = undefined
+              }
+              if (agent) break
+            }
+          }
+          if (!agent) {
+            reply(res, 409, { ok: false, error: 'agent-not-live' })
+            return
+          }
+          const presets = ctx.get('agentPresets')
+          const compaction =
+            presets && typeof presets.serviceFor === 'function'
+              ? presets.serviceFor(agent, 'compaction')
+              : undefined
+          if (!compaction || typeof compaction.compactIfNeeded !== 'function') {
+            reply(res, 409, { ok: false, error: 'compaction-unavailable' })
+            return
+          }
+          const key = typeof agent.id === 'string' ? agent.id : sessionId
+          if (activeCompactions.has(key)) {
+            reply(res, 409, { ok: false, error: 'compaction-busy' })
+            return
+          }
+          activeCompactions.add(key)
+          const watchdog = new AbortController()
+          const timer = setTimeout(() => {
+            try {
+              watchdog.abort(new Error('ui-enhance: compaction timed out'))
+            } catch (error) {
+              /* the controller is only aborted once */
+            }
+          }, compactTimeoutMs)
+          try {
+            probe('compact-manual', { sessionId })
+            const result = await compaction.compactIfNeeded(agent, 'context-overflow', watchdog.signal)
+            probe(result ? 'compact-manual-done' : 'compact-manual-skip', { sessionId })
+            reply(res, 200, { ok: true, compacted: result !== null && result !== undefined })
+          } catch (error) {
+            probe('compact-manual-failed', { message: String((error && error.message) || error) })
+            reply(res, 200, { ok: false, error: String((error && error.message) || error) })
+          } finally {
+            clearTimeout(timer)
+            activeCompactions.delete(key)
+          }
+        },
+      }),
+    'ui-enhance: manual compaction route',
   )
 
   /**

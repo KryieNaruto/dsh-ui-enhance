@@ -12,7 +12,7 @@ window.__ModuleLoader__.load({
 
     const NS = 'ui-enhance';
     /** Release marker: also the revision the desktop boot plan addresses for this bundle. */
-    const CLIENT_BUILD = '0.9.37';
+    const CLIENT_BUILD = '0.9.63';
     const QUOTA_URL = '/plugin/ui-enhance/quota';
     const W = 1000000;
     const QUOTA_REFRESH_MS = 60000;
@@ -60,9 +60,6 @@ window.__ModuleLoader__.load({
         /* diagnostics only */
       }
     };
-
-    /** Diagnostics: composer HUD burst measurements, reported through the probe ring. */
-    const noteHudBurst = (data) => probe('hud-burst', data);
 
     /**
      * Remove the force-reload marker from the address bar. The marker exists only to make the
@@ -447,6 +444,8 @@ window.__ModuleLoader__.load({
     const WINDOW_DEFAULT_KEY = '__default';
     /** Host mirror of the browser-local budgets; drives compaction in the middle of a turn. */
     const BUDGETS_PATH = '/plugin/ui-enhance/budgets';
+    /** Points the profile's model entry at the chosen tier, so dsh itself reports that capacity. */
+    const CONTEXT_WINDOW_PATH = '/plugin/ui-enhance/context-window';
     /** Re-send the budget mirror so a Host restart cannot leave budgets unenforced. */
     const BUDGETS_RESYNC_MS = 60000;
     /**
@@ -457,6 +456,8 @@ window.__ModuleLoader__.load({
     const ABORT_PATH = '/plugin/ui-enhance/abort';
     /** Host-side open compaction markers, so a stuck compaction is visible before any click. */
     const COMPACTIONS_PATH = '/plugin/ui-enhance/compactions';
+    /** Forced compaction through the Host; the shipped `/compact` refuses while busy. */
+    const COMPACT_PATH = '/plugin/ui-enhance/compact';
     const COMPACTION_POLL_MS = 5000;
     /**
      * A compaction this old is presumed stuck, not merely slow: a normal summary finishes in
@@ -465,6 +466,14 @@ window.__ModuleLoader__.load({
     const COMPACT_STUCK_MS = 30000;
     /** How long the local compaction lock survives a requested abort when the call never settles. */
     const ABORT_GRACE_MS = 8000;
+
+    /**
+     * A full-screen backdrop shader runs on the same thread as the list scrolling in front
+     * of it. Every scroll event pushes the next paint out by this much, so the backdrop
+     * holds its last frame while a heavy view moves and resumes as soon as it settles.
+     */
+    const SHADER_SCROLL_PAUSE_MS = 220;
+
     /** How long the clear-context action stays armed waiting for its confirming second click. */
     const CLEAR_ARM_MS = 4000;
     /** Safety release for the clear-context lock when switching Sessions is slower than expected. */
@@ -2611,6 +2620,8 @@ function usePaneFocus(enabled) {
         boxW: 0,
         boxH: 0,
         boxDirty: false,
+        /** Wall clock before which `paintFrame` returns without touching GL. */
+        pausedUntil: 0,
       };
       const mouse = { x: 0, y: 0, clickX: 0, clickY: 0, down: 0 };
       /* The canvas box is measured off the rAF path: reading it every frame forced
@@ -2810,6 +2821,9 @@ function usePaneFocus(enabled) {
          * frame and halve the backdrop to 30 fps. */
         if (now - state.lastDraw < shaderBudget.intervalMs - 2) return;
         state.lastDraw = now;
+        /* A scroll is in progress: the backdrop is behind an opaque moving view anyway,
+         * and skip-and-hold costs nothing while it frees the frame for the list. */
+        if (now < state.pausedUntil) return;
 
         /* Tab in the background: skip the whole render. Nothing is visible, and this is
          * the single biggest saving when the window is minimised or covered. */
@@ -2894,6 +2908,12 @@ function usePaneFocus(enabled) {
       window.addEventListener('pointermove', onMove, { passive: true });
       window.addEventListener('pointerdown', onDown, { passive: true });
       window.addEventListener('pointerup', onUp, { passive: true });
+      /* Capture on `window` sees scrolls from every nested scroller; the handler only
+       * writes a timestamp, so it is free even at one event per frame. */
+      const onScroll = () => {
+        state.pausedUntil = window.performance.now() + SHADER_SCROLL_PAUSE_MS;
+      };
+      window.addEventListener('scroll', onScroll, { capture: true, passive: true });
 
       const releasePasses = () => {
         for (const entry of state.passes) {
@@ -3046,6 +3066,7 @@ function usePaneFocus(enabled) {
         window.removeEventListener('pointermove', onMove);
         window.removeEventListener('pointerdown', onDown);
         window.removeEventListener('pointerup', onUp);
+        window.removeEventListener('scroll', onScroll, { capture: true });
         try {
           if (state.quad) gl.deleteBuffer(state.quad);
           for (const texture of state.channels) if (texture) gl.deleteTexture(texture);
@@ -3353,25 +3374,6 @@ function usePaneFocus(enabled) {
         }
         node.setAttribute(GLASS_ATTR, '');
       }
-      /* TEMPORARY DIAGNOSTIC: how many panes were decorated, and with what geometry.
-       * "Glass is invisible" is ambiguous between "no pane was found" and "a pane was
-       * found but the blur has nothing behind it" -- this separates the two. */
-      probe('glass-apply', {
-        requested: targets.length,
-        painted: document.querySelectorAll('[' + GLASS_ATTR + ']').length,
-        vw: window.innerWidth,
-        vh: window.innerHeight,
-        boxes: targets.slice(0, 4).map((n) => {
-          const r = n.getBoundingClientRect();
-          const cls = typeof n.className === 'string' ? n.className : '';
-          return {
-            w: Math.round(r.width),
-            h: Math.round(r.height),
-            cls: cls.split(/\s+/).filter((c) => /Col/.test(c)).join(',') || cls.split(/\s+/)[0] || '',
-            glass: n.hasAttribute(GLASS_ATTR),
-          };
-        }),
-      });
     }
 
     async function loadShaderWork(rawId, force) {
@@ -4035,6 +4037,15 @@ function usePaneFocus(enabled) {
          * page becomes visible again: a Host restart (plugin reinstall, app relaunch) must not
          * leave a budget unenforced until the next tier change.
          */
+        const pushContextWindow = (size) => {
+          if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0) return;
+          fetch(CONTEXT_WINDOW_PATH, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ contextWindow: Math.round(size) }),
+          }).catch(() => {});
+        };
+
         ctx.effect(() => {
           let stopped = false;
           const push = (attempt) => {
@@ -4656,6 +4667,23 @@ function usePaneFocus(enabled) {
         }
 
         async function compactSession(sessionId) {
+          /* A running agent makes the shipped command refuse, and a sub-agent is running for
+           * its whole life, so the manual button used to fail every time. The Host half can
+           * reduce the surface mid-turn; the command stays as the fallback for a Session
+           * that has no live agent. */
+          try {
+            const response = await fetch(COMPACT_PATH, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ sessionId }),
+            });
+            if (response.ok) {
+              const body = await response.json();
+              if (body && body.ok === true) return body;
+            }
+          } catch (error) {
+            /* an older Host has no such route: fall back to the command */
+          }
           const live = ctx.get('remote');
           const commands = remoteCommands || (live && live.commands);
           if (!commands || typeof commands.execute !== 'function') throw new Error('remote-unavailable');
@@ -4894,6 +4922,7 @@ function usePaneFocus(enabled) {
             const apply = () => {
               patchMeter();
               syncPanel();
+              patchInsight();
             };
 
             const attach = (next) => {
@@ -4924,6 +4953,117 @@ function usePaneFocus(enabled) {
             });
             dockObserver.observe(dock, { childList: true });
 
+            /* The shipped hover tip is a body-level portal, so it is never a descendant
+             * of the meter and `patchMeter` cannot see it. Its own percentage is computed
+             * against `contextWindow`, so rescale it by the ratio the two denominators
+             * differ by rather than looking for which meter it is tethered to. */
+            /* Every write re-enters the observer, so remember the exact text we produced:
+             * rescaling our own output would multiply by the window ratio on each pass and
+             * pin the reading at 100%. A fresh value from the shipped side never matches. */
+            const bubbleWritten = new WeakMap();
+            const patchBubble = () => {
+              const state = stateRef.current;
+              const windowSize = pressure && typeof pressure.contextWindow === 'number' ? pressure.contextWindow : 0;
+              if (!state || state.ready !== true) return;
+              if (budget === undefined || windowSize <= 0 || windowSize === budget) return;
+              for (const bubble of document.querySelectorAll('[class*="_bubble_"]')) {
+                const label = bubble.querySelector('[class*="_label_"]');
+                if (label === null) continue;
+                const current = String(label.textContent || '');
+                if (bubbleWritten.get(label) === current) continue;
+                const match = /(已用|used)\s*([0-9]+)\s*%/i.exec(current);
+                if (match === null) continue;
+                const percent = Math.min(100, Math.round((Number(match[2]) * windowSize) / budget));
+                const next = current.replace(match[0], match[1] + ' ' + percent + '%');
+                if (next === current) continue;
+                label.textContent = next;
+                bubbleWritten.set(label, next);
+              }
+            };
+
+            /* The context-insight panel is a separate plugin (`lc-*` classes) that prints
+             * its own used / capacity / percentage from `contextWindow`. Rewrite all three
+             * from the numbers the ring already uses, so one screen cannot show two
+             * denominators. Its own markup is `<b>used</b><span>/ cap tokens</span>` plus a
+             * `lc-overview-pct` block holding the percentage. */
+            const patchInsight = () => {
+              const state = stateRef.current;
+              if (!state || state.ready !== true) return;
+              if (budget === undefined) return;
+              for (const num of document.querySelectorAll('[class*="lc-overview-num"]')) {
+                const used = num.querySelector('b');
+                const usedText = formatAmount(state.used);
+                if (used !== null && used.textContent !== usedText) used.textContent = usedText;
+                for (const span of num.querySelectorAll('span')) {
+                  const text = String(span.textContent || '');
+                  if (text.indexOf('tokens') < 0) continue;
+                  const next = '/ ' + formatAmount(state.capacity) + ' tokens';
+                  if (text !== next) span.textContent = next;
+                }
+                const percent = num.querySelector('[class*="lc-overview-pct"] b');
+                if (percent !== null && percent.textContent !== state.text) percent.textContent = state.text;
+              }
+              /* The stacked bar draws every segment as a share of the model window, and its
+               * occupied box already equals the sum of the segments -- so the ratio between
+               * the two is all we need, with no window size involved. Scale the segments to
+               * our percentage, rebuild the free remainder, and hide the reserve bands: they
+               * mark the shipped window's headroom thresholds, which mean nothing at a
+               * different tier. */
+              for (const occupied of document.querySelectorAll('[class*="lc-occupied-box"]')) {
+                const stack = occupied.parentElement;
+                if (stack === null) continue;
+                const base = parseFloat(String(occupied.style.width || ''));
+                if (!(base > 0)) continue;
+                const scale = state.percent / base;
+                if (!(scale > 0) || Math.abs(scale - 1) < 0.001) continue;
+                let sum = 0;
+                for (const seg of stack.children) {
+                  if (seg.className.indexOf('lc-stacked-seg') < 0) continue;
+                  const width = parseFloat(String(seg.style.width || ''));
+                  if (!(width > 0)) continue;
+                  const next = width * scale;
+                  sum += next;
+                  const text = next.toFixed(4) + '%';
+                  if (seg.style.width !== text) seg.style.width = text;
+                }
+                if (sum <= 0) continue;
+                const occupiedText = Math.min(100, sum).toFixed(4) + '%';
+                if (occupied.style.width !== occupiedText) occupied.style.width = occupiedText;
+                for (const free of stack.children) {
+                  if (free.className.indexOf('lc-stacked-free') < 0) continue;
+                  const freeText = Math.max(0, 100 - sum).toFixed(4) + '%';
+                  if (free.style.width !== freeText) free.style.width = freeText;
+                }
+                for (const reserve of stack.children) {
+                  if (reserve.className.indexOf('lc-reserve') < 0) continue;
+                  if (reserve.style.display !== 'none') reserve.style.display = 'none';
+                }
+              }
+            };
+
+            const bubbleObserver = new MutationObserver((records) => {
+              let bubbleTouched = false;
+              let insightTouched = false;
+              const inspect = (node) => {
+                if (node === null || node === undefined || node.nodeType !== 1) return;
+                if (typeof node.closest === 'function') {
+                  if (node.closest('[class*="_bubble_"]') !== null) bubbleTouched = true;
+                  if (node.closest('[class*="lc-"]') !== null) insightTouched = true;
+                }
+                if (typeof node.querySelector === 'function') {
+                  if (node.querySelector('[class*="_bubble_"]') !== null) bubbleTouched = true;
+                  if (node.querySelector('[class*="lc-overview"]') !== null) insightTouched = true;
+                }
+              };
+              for (const record of records) {
+                if (record.type === 'characterData') inspect(record.target.parentElement);
+                else for (const node of record.addedNodes) inspect(node);
+              }
+              if (bubbleTouched) patchBubble();
+              if (insightTouched) patchInsight();
+            });
+            bubbleObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+
             const onPointer = () => syncPanel();
             dock.addEventListener('pointerdown', onPointer, true);
             dock.addEventListener('click', onPointer, true);
@@ -4936,6 +5076,7 @@ function usePaneFocus(enabled) {
               dockObserver.disconnect();
               if (meterObserver !== null) meterObserver.disconnect();
               if (panelObserver !== null) panelObserver.disconnect();
+              bubbleObserver.disconnect();
               dock.removeEventListener('pointerdown', onPointer, true);
               dock.removeEventListener('click', onPointer, true);
               controllerRef.current = null;
@@ -4957,39 +5098,6 @@ function usePaneFocus(enabled) {
           const [open, setOpen] = React.useState(false);
           const [anchor, setAnchor] = React.useState(null);
           const triggerRef = React.useRef(null);
-          // beautify-probe-installed
-          /* TEMPORARY DIAGNOSTIC.
-           *
-           * Reports, from the live page, whether a pointerdown/click lands on the
-           * beautify trigger at all. The earlier effect-scoped probes only fire once
-           * React has mounted the panel, so "no events at all" could equally mean
-           * "the click never got here" -- this listener disambiguates the two. */
-          React.useEffect(() => {
-            const onDown = (event) => {
-              const t = event.target;
-              let hit = null;
-              let cursor = t && t.nodeType === 1 ? t : null;
-              for (let d = 0; cursor !== null && d < 64; d += 1) {
-                if (cursor.hasAttribute && cursor.hasAttribute('data-ui-enhance-beautify-btn')) {
-                  hit = 'btn';
-                  break;
-                }
-                if (cursor.hasAttribute && cursor.hasAttribute('data-ui-enhance-beautify')) {
-                  hit = 'panel';
-                  break;
-                }
-                cursor = cursor.parentNode || null;
-              }
-              const tag = t && t.nodeType === 1 ? String(t.tagName || '?').toLowerCase() : String(t);
-              probe('beautify-hit', { phase: event.type, hit: hit, tag: tag, open: open });
-            };
-            document.addEventListener('pointerdown', onDown, true);
-            document.addEventListener('click', onDown, true);
-            return () => {
-              document.removeEventListener('pointerdown', onDown, true);
-              document.removeEventListener('click', onDown, true);
-            };
-          }, [open]);
 
           React.useEffect(() => {
             if (!open) return undefined;
@@ -5040,7 +5148,9 @@ function usePaneFocus(enabled) {
           const label = effective === undefined ? t('windowAuto') : formatTier(effective);
 
           const choose = (value) => {
-            windowStore.set(props.sessionId, value === WINDOW_AUTO ? undefined : Number(value));
+            const size = value === WINDOW_AUTO ? undefined : Number(value);
+            windowStore.set(props.sessionId, size);
+            if (typeof size === 'number') pushContextWindow(size);
             setOpen(false);
             if (triggerRef.current !== null) triggerRef.current.focus();
           };
@@ -5187,7 +5297,6 @@ function usePaneFocus(enabled) {
             if (!(cardHeight > 0)) return;
             const height = Math.min(cardHeight, HUD_MAX_HEIGHT);
             const top = Math.max(0, cardHeight - height);
-            noteHudBurst({ h: cardHeight, w: Math.round(cardBox.width), height, top });
             node.style.top = top + 'px';
             node.style.height = height > 0 ? height + 'px' : '';
           };
@@ -5215,223 +5324,6 @@ function usePaneFocus(enabled) {
               window.removeEventListener('resize', measure);
             };
           }, []);
-
-          /* Temporary: report whether the floating panel actually mounts and where it lands. */
-          React.useEffect(() => {
-            probe('hud-mount', { sessionId });
-            const timer = window.setTimeout(() => {
-              const node = hostRef.current;
-              if (!node || typeof node.getBoundingClientRect !== 'function') {
-                probe('hud-rect-missing', { sessionId });
-                return;
-              }
-              const rect = node.getBoundingClientRect();
-              probe('hud-rect', {
-                sessionId,
-                x: Math.round(rect.x),
-                y: Math.round(rect.y),
-                w: Math.round(rect.width),
-                h: Math.round(rect.height),
-              });
-            }, 1200);
-            return () => window.clearTimeout(timer);
-          }, [sessionId]);
-
-          /* Temporary: sample HUD geometry so the multi-line disappearance can be diagnosed. */
-          React.useEffect(() => {
-            let disposed = false;
-            const readBoxes = () => {
-              const node = hostRef.current;
-              if (!node) return null;
-              const anchor = node.closest('[data-composer-overlay]');
-              const card = anchor ? anchor.parentElement : null;
-              if (!card) return null;
-              const editor =
-                card.querySelector('textarea') ||
-                card.querySelector('[contenteditable="true"]') ||
-                card.querySelector('[contenteditable]');
-              return {
-                node,
-                card,
-                editor,
-                cardBox: card.getBoundingClientRect(),
-                panelBox: node.getBoundingClientRect(),
-                editorBox: editor ? editor.getBoundingClientRect() : null,
-              };
-            };
-            const snapshot = (tag, extra) => {
-              const boxes = readBoxes();
-              if (!boxes) return;
-              const { node, card, cardBox, panelBox, editorBox } = boxes;
-              const panelStyle = window.getComputedStyle(node);
-              const ancestors = [];
-              let cursor = node.parentElement;
-              let depth = 0;
-              while (cursor && depth < 18) {
-                const style = window.getComputedStyle(cursor);
-                const box = cursor.getBoundingClientRect();
-                ancestors.push({
-                  tag: cursor.tagName,
-                  cls: String(cursor.className || '').slice(0, 32),
-                  overflow: style.overflow,
-                  display: style.display,
-                  opacity: style.opacity,
-                  zIndex: style.zIndex,
-                  position: style.position,
-                  transform: style.transform === 'none' ? undefined : style.transform,
-                  filter: style.filter === 'none' ? undefined : style.filter,
-                  contain: style.contain === 'none' ? undefined : style.contain,
-                  clipPath: style.clipPath === 'none' ? undefined : style.clipPath,
-                  top: Math.round(box.top),
-                  h: Math.round(box.height),
-                });
-                cursor = cursor.parentElement;
-                depth += 1;
-              }
-              let covered = 'none';
-              let stack = [];
-              try {
-                const midX = panelBox.left + panelBox.width / 2;
-                const midY = panelBox.top + panelBox.height / 2;
-                const hits = document.elementsFromPoint(midX, midY) || [];
-                stack = hits.slice(0, 8).map((hit) => {
-                  if (hit === node || node.contains(hit)) return 'self';
-                  if (hit === card || card.contains(hit)) return 'card:' + hit.tagName;
-                  return hit.tagName + '.' + String(hit.className || '').slice(0, 28);
-                });
-                const hit = hits[0];
-                if (hit) {
-                  if (hit === node || node.contains(hit)) covered = 'self';
-                  else if (hit === card || card.contains(hit)) covered = 'card:' + hit.tagName;
-                  else covered = hit.tagName + '.' + String(hit.className || '').slice(0, 36);
-                }
-              } catch (error) {
-                covered = 'error';
-              }
-              probe('hud-geometry', {
-                tag,
-                sessionId,
-                cardH: Math.round(cardBox.height),
-                cardTop: Math.round(cardBox.top),
-                editorH: editorBox ? Math.round(editorBox.height) : undefined,
-                panelTop: Math.round(panelBox.top),
-                panelH: Math.round(panelBox.height),
-                panelLeft: Math.round(panelBox.left),
-                styleTop: node.style.top,
-                styleHeight: node.style.height,
-                visibility: panelStyle.visibility,
-                display: panelStyle.display,
-                opacity: panelStyle.opacity,
-                zIndex: panelStyle.zIndex,
-                position: panelStyle.position,
-                inView:
-                  panelBox.bottom > 0 &&
-                  panelBox.top < window.innerHeight &&
-                  panelBox.right > 0 &&
-                  panelBox.left < window.innerWidth,
-                covered,
-                stack,
-                ancestors,
-                vw: window.innerWidth,
-                vh: window.innerHeight,
-                ...extra,
-              });
-            };
-            let lastKey = '';
-            let lastPresent = true;
-            const timer = window.setInterval(() => {
-              if (disposed) return;
-              const boxes = readBoxes();
-              if (!boxes) {
-                if (lastPresent) {
-                  lastPresent = false;
-                  probe('hud-geometry', {
-                    tag: 'unmounted',
-                    sessionId,
-                    hudNodes: document.querySelectorAll('[data-ui-enhance-hud]').length,
-                    overlayNodes: document.querySelectorAll('[data-composer-overlay]').length,
-                  });
-                }
-                return;
-              }
-              if (!lastPresent) {
-                lastPresent = true;
-                snapshot('remounted', {});
-                return;
-              }
-              const key = [
-                Math.round(boxes.cardBox.height),
-                Math.round(boxes.panelBox.top),
-                Math.round(boxes.panelBox.height),
-                Math.round(boxes.panelBox.left),
-              ].join('/');
-              if (key !== lastKey) {
-                lastKey = key;
-                snapshot('sample', {});
-              }
-            }, 350);
-            /* Per-keystroke composer census: which cards exist, which one grows, where our HUD is. */
-            const describeCards = () => {
-              const out = [];
-              const cards = document.querySelectorAll('[data-composer-card]');
-              for (let index = 0; index < cards.length && index < 6; index += 1) {
-                const card = cards[index];
-                const box = card.getBoundingClientRect();
-                const anchor = card.querySelector('[data-composer-overlay]');
-                const hud = anchor ? anchor.querySelector('[data-dsh-plugin="ui-enhance-hud"]') : null;
-                const hudBox = hud ? hud.getBoundingClientRect() : null;
-                const editor = card.querySelector('[contenteditable="true"]');
-                out.push({
-                  top: Math.round(box.top),
-                  h: Math.round(box.height),
-                  w: Math.round(box.width),
-                  hud: hudBox
-                    ? {
-                        top: Math.round(hudBox.top),
-                        h: Math.round(hudBox.height),
-                        left: Math.round(hudBox.left),
-                      }
-                    : null,
-                  len: editor ? (editor.textContent || '').length : null,
-                  vis: typeof card.checkVisibility === 'function' ? card.checkVisibility() : true,
-                });
-              }
-              return out;
-            };
-            const typedCardOf = (event) => {
-              const target = event.target;
-              if (!(target instanceof Element)) return null;
-              const card = target.closest('[data-composer-card]');
-              if (!card) return null;
-              const anchor = card.querySelector('[data-composer-overlay]');
-              const node = hostRef.current;
-              return anchor && node && anchor.contains(node) ? card : null;
-            };
-            const onKeyDown = (event) => {
-              if (disposed) return;
-              if (event.key === 'Process' || event.key === 'Shift' || event.key === 'Alt') return;
-              if (typedCardOf(event) === null) return;
-              probe('hud-key', {
-                key: event.key,
-                sessionId,
-                cardH: Math.round((hostRef.current && hostRef.current.getBoundingClientRect().height) || 0),
-                cards: describeCards(),
-              });
-            };
-            const onInput = (event) => {
-              if (disposed) return;
-              if (typedCardOf(event) === null) return;
-              probe('hud-input', { sessionId, cards: describeCards() });
-            };
-            document.addEventListener('keydown', onKeyDown, true);
-            document.addEventListener('input', onInput, true);
-            return () => {
-              disposed = true;
-              window.clearInterval(timer);
-              document.removeEventListener('keydown', onKeyDown, true);
-              document.removeEventListener('input', onInput, true);
-            };
-          }, [sessionId]);
 
           const hasUsage = usage !== undefined;
           React.useEffect(() => {
@@ -6477,38 +6369,6 @@ function usePaneFocus(enabled) {
           const [shader, setShader] = React.useState(() => shaderStatus.get());
           const [notice, setNotice] = React.useState(null);
           const triggerRef = React.useRef(null);
-          // beautify-probe-installed
-          /* TEMPORARY DIAGNOSTIC.
-           *
-           * Records, from the live page, whether a pointer event reaches the beautify
-           * trigger or panel at all. Without it "the panel vanished" cannot be told
-           * apart from "the click never arrived". */
-          React.useEffect(() => {
-            const onDown = (event) => {
-              const t = event.target;
-              let hit = null;
-              let cursor = t && t.nodeType === 1 ? t : null;
-              for (let d = 0; cursor !== null && d < 64; d += 1) {
-                if (cursor.hasAttribute && cursor.hasAttribute('data-ui-enhance-beautify-btn')) {
-                  hit = 'btn';
-                  break;
-                }
-                if (cursor.hasAttribute && cursor.hasAttribute('data-ui-enhance-beautify')) {
-                  hit = 'panel';
-                  break;
-                }
-                cursor = cursor.parentNode || null;
-              }
-              const tag = t && t.nodeType === 1 ? String(t.tagName || '?').toLowerCase() : String(t);
-              probe('beautify-hit', { phase: event.type, hit: hit, tag: tag, open: open });
-            };
-            document.addEventListener('pointerdown', onDown, true);
-            document.addEventListener('click', onDown, true);
-            return () => {
-              document.removeEventListener('pointerdown', onDown, true);
-              document.removeEventListener('click', onDown, true);
-            };
-          }, [open]);
 
           React.useEffect(() => shaderStatus.subscribe(() => setShader(shaderStatus.get())), []);
 

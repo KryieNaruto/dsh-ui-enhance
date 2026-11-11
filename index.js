@@ -1109,7 +1109,7 @@ export function apply(ctx, config = {}) {
             preStepSeen = true
             probe('pre-step', { sessionId })
           }
-          const budget = sessionId === undefined ? undefined : budgets.get(sessionId)
+          const budget = sessionId === undefined ? undefined : (budgets.get(sessionId) ?? budgets.get('__default'))
           if (budget !== undefined && !(signal && signal.aborted) && !activeCompactions.has(sessionId)) {
             const now = Date.now()
             if (now - (lastAttempt.get(sessionId) || 0) >= AUTO_COMPACT_COOLDOWN_MS) {

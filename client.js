@@ -443,6 +443,8 @@ window.__ModuleLoader__.load({
     const WINDOW_TIERS = [200000, 400000, 800000, 1000000];
     const WINDOW_AUTO = 'auto';
     const STORAGE_KEY = 'ui-enhance.session-windows';
+    /** Reserved entry in that map: the budget every Session inherits unless it has its own. */
+    const WINDOW_DEFAULT_KEY = '__default';
     /** Host mirror of the browser-local budgets; drives compaction in the middle of a turn. */
     const BUDGETS_PATH = '/plugin/ui-enhance/budgets';
     /** Re-send the budget mirror so a Host restart cannot leave budgets unenforced. */
@@ -851,6 +853,20 @@ window.__ModuleLoader__.load({
         all() {
           return { ...load() };
         },
+        default() {
+          const value = load()[WINDOW_DEFAULT_KEY];
+          return typeof value === 'number' && value > 0 ? value : undefined;
+        },
+        effective(sessionId) {
+          return this.get(sessionId) ?? this.default();
+        },
+        setDefault(value) {
+          const store = load();
+          if (typeof value === 'number' && value > 0) store[WINDOW_DEFAULT_KEY] = value;
+          else delete store[WINDOW_DEFAULT_KEY];
+          persist();
+          for (const listener of Array.from(listeners)) listener();
+        },
         set(sessionId, value) {
           if (!sessionId) return;
           const store = load();
@@ -875,8 +891,10 @@ window.__ModuleLoader__.load({
        * A hard 200K default pinned every session to a fifth of a 1M window, so the
        * ring read 90% at 180K, auto-compaction armed in sessions the user never gave
        * a budget, and the sidebar bars (which already fall back to the live
-       * contextWindow) disagreed with the HUD. */
-      return windowStore.get(sessionId);
+       * contextWindow) disagreed with the HUD.
+       * Otherwise this is the effective budget: the Session's own setting, else the
+       * user's explicit "default for all Sessions" (which also covers sub-agents). */
+      return windowStore.effective(sessionId);
     }
 
     /**
@@ -4936,7 +4954,7 @@ function usePaneFocus(enabled) {
         }
 
         function WindowSelect(props) {
-          const budget = useSessionWindow(props.sessionId);
+          useSessionWindow(props.sessionId);
           const [open, setOpen] = React.useState(false);
           const [anchor, setAnchor] = React.useState(null);
           const triggerRef = React.useRef(null);
@@ -5016,8 +5034,11 @@ function usePaneFocus(enabled) {
             };
           }, [open]);
 
-          const current = budget === undefined ? WINDOW_AUTO : String(budget);
-          const label = budget === undefined ? t('windowAuto') : formatTier(budget);
+          /* Effective, not stored: a Session without its own budget inherits the
+           * "default for all Sessions", and the trigger must show that inherited tier. */
+          const effective = windowStore.effective(props.sessionId);
+          const current = effective === undefined ? WINDOW_AUTO : String(effective);
+          const label = effective === undefined ? t('windowAuto') : formatTier(effective);
 
           const choose = (value) => {
             windowStore.set(props.sessionId, value === WINDOW_AUTO ? undefined : Number(value));
@@ -5028,6 +5049,12 @@ function usePaneFocus(enabled) {
           const options = [{ key: 'auto', value: WINDOW_AUTO, label: t('windowAuto') }].concat(
             WINDOW_TIERS.map((tier) => ({ key: String(tier), value: String(tier), label: formatTier(tier) })),
           );
+
+          /* The "default for all Sessions" row mirrors the effective tier: it can only be
+           * set while a concrete tier is in effect (an auto Session has nothing to copy). */
+          const defaultBudget = windowStore.default();
+          const inheritsDefault = typeof effective === 'number' && defaultBudget === effective;
+          const defaultIsAuto = typeof effective !== 'number';
 
           let menu = null;
           if (open && anchor !== null) {
@@ -5060,6 +5087,26 @@ function usePaneFocus(enabled) {
                   h('span', { key: 'label' }, option.label),
                   current === option.value ? h('span', { key: 'check', 'aria-hidden': true }, '✓') : null,
                 ),
+              ),
+              h(
+                'button',
+                {
+                  key: 'default',
+                  type: 'button',
+                  role: 'menuitemcheckbox',
+                  'aria-checked': inheritsDefault ? 'true' : 'false',
+                  'aria-disabled': defaultIsAuto ? 'true' : undefined,
+                  disabled: defaultIsAuto,
+                  'data-ui-enhance-menu-item': '',
+                  'data-active': inheritsDefault ? 'true' : undefined,
+                  onClick: () => {
+                    if (defaultIsAuto) return;
+                    windowStore.setDefault(inheritsDefault ? undefined : effective);
+                    setOpen(false);
+                  },
+                },
+                h('span', { key: 'label' }, '所有会话默认（含子 Agent）'),
+                inheritsDefault ? h('span', { key: 'check', 'aria-hidden': true }, '✓') : null,
               ),
             );
             if (ReactDOM !== null && typeof ReactDOM.createPortal === 'function') {
@@ -7111,7 +7158,7 @@ function usePaneFocus(enabled) {
             if (!pressure) continue;
             const used =
               typeof pressure.projectedTokens === 'number' ? pressure.projectedTokens : pressure.pressureTokens;
-            const budget = windowStore.get(id);
+            const budget = windowStore.effective(id);
             const capacity = budget !== undefined ? budget : pressure.contextWindow;
             if (typeof used !== 'number' || typeof capacity !== 'number' || capacity <= 0) continue;
             const percent = Math.min(100, Math.round((used / capacity) * 100));
